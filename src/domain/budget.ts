@@ -37,6 +37,7 @@ export interface Ledger {
   spent: number;
   reserved: number;
   reservations: Map<string, Reservation>;
+  sent: Set<string>;
 }
 
 export interface Decision<R> {
@@ -48,6 +49,11 @@ export interface Booking {
   reservationId: string;
   taskId: string;
   changes: Change[];
+}
+
+export interface Sweep {
+  thresholds: Change[];
+  bookings: Booking[];
 }
 
 export type MonthNumbers = Omit<BudgetMonthV1, "rev" | "asOf">;
@@ -73,7 +79,11 @@ export const emptyLedger = (month: string): Ledger => ({
   spent: 0,
   reserved: 0,
   reservations: new Map(),
+  sent: new Set(),
 });
+
+export const thresholdKey = (cap: "soft" | "hard", percent: number): string =>
+  `${cap}:${String(percent)}`;
 
 export function monthKey(date: Date, timeZone: string): string {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -148,6 +158,8 @@ export function evolveLedger(ledger: Ledger, change: Change): Ledger {
       break;
     }
     case "budget.ThresholdCrossed":
+      ledger.sent.add(thresholdKey(change.payload.cap, change.payload.percent));
+      break;
     case "budget.BudgetSet":
       break;
   }
@@ -169,34 +181,37 @@ export function monthNumbers(ledger: Ledger, cap: Cap | undefined): MonthNumbers
   };
 }
 
-export function crossings(
+export function dueThresholds(
   month: string,
   cap: Cap | undefined,
-  before: number,
-  after: number,
+  spent: number,
+  sent: Set<string>,
 ): Change[] {
-  if (cap === undefined) return [];
-  const caps = [
+  if (cap === undefined || spent === 0) return [];
+  const due: Change[] = [];
+  for (const [kind, amount] of [
     ["soft", cap.soft],
     ["hard", cap.hard],
-  ] as const;
-  return caps.flatMap(([kind, amount]) =>
-    amount === undefined
-      ? []
-      : percents
-          .filter((percent) => before * 100 < amount * percent && after * 100 >= amount * percent)
-          .map((percent) => ({
-            type: "budget.ThresholdCrossed" as const,
-            schemaVersion: 1 as const,
-            payload: {
-              scope: { kind: "month" as const, key: month },
-              cap: kind,
-              percent,
-              spentMicroUsd: after,
-              capMicroUsd: amount,
-            },
-          })),
-  );
+  ] as const) {
+    if (amount === undefined) continue;
+    for (const percent of percents) {
+      const key = thresholdKey(kind, percent);
+      if (spent * 100 < amount * percent || sent.has(key)) continue;
+      sent.add(key);
+      due.push({
+        type: "budget.ThresholdCrossed",
+        schemaVersion: 1,
+        payload: {
+          scope: { kind: "month", key: month },
+          cap: kind,
+          percent,
+          spentMicroUsd: spent,
+          capMicroUsd: amount,
+        },
+      });
+    }
+  }
+  return due;
 }
 
 const replyOf = (reservationId: string, found: Reservation): ReserveFundsReplyV1 =>
@@ -256,13 +271,14 @@ const expire = (
   reservationId: string,
   amount: number,
   spent: number,
+  sent: Set<string>,
 ): Change[] => [
   {
     type: "budget.ReservationExpired",
     schemaVersion: 1,
     payload: { reservationId, amountMicroUsd: amount },
   },
-  ...crossings(ledger.month, cap, spent, spent + amount),
+  ...dueThresholds(ledger.month, cap, spent + amount, sent),
 ];
 
 export function decideSettle(
@@ -287,7 +303,7 @@ export function decideSettle(
   if (Date.parse(found.expiresAt) <= now.getTime()) {
     return {
       reply: expired,
-      changes: expire(ledger, cap, reservationId, found.amount, ledger.spent),
+      changes: expire(ledger, cap, reservationId, found.amount, ledger.spent, new Set(ledger.sent)),
     };
   }
   return {
@@ -298,12 +314,19 @@ export function decideSettle(
         schemaVersion: 1,
         payload: { reservationId, reservedMicroUsd: found.amount, actualMicroUsd },
       },
-      ...crossings(ledger.month, cap, ledger.spent, ledger.spent + actualMicroUsd),
+      ...dueThresholds(ledger.month, cap, ledger.spent + actualMicroUsd, new Set(ledger.sent)),
     ],
   };
 }
 
-export function decideExpiry(ledger: Ledger, cap: Cap | undefined, now: Date): Booking[] {
+export function decideSweep(
+  ledger: Ledger,
+  cap: Cap | undefined,
+  now: Date,
+  { thresholds }: { thresholds: boolean },
+): Sweep {
+  const sent = new Set(ledger.sent);
+  const due = thresholds ? dueThresholds(ledger.month, cap, ledger.spent, sent) : [];
   const bookings: Booking[] = [];
   let spent = ledger.spent;
   for (const [reservationId, found] of ledger.reservations) {
@@ -311,11 +334,11 @@ export function decideExpiry(ledger: Ledger, cap: Cap | undefined, now: Date): B
     bookings.push({
       reservationId,
       taskId: found.taskId,
-      changes: expire(ledger, cap, reservationId, found.amount, spent),
+      changes: expire(ledger, cap, reservationId, found.amount, spent, sent),
     });
     spent += found.amount;
   }
-  return bookings;
+  return { thresholds: due, bookings };
 }
 
 export function decideSetBudget(payload: SetBudgetCommandPayloadV1): Change[] {

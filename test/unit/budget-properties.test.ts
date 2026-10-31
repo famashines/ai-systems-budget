@@ -2,14 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { eventRegistry } from "@famashines/ai-systems-contracts";
 import {
-  crossings,
-  decideExpiry,
   decideReserve,
   decideSettle,
+  decideSweep,
+  dueThresholds,
   emptyLedger,
   evolveLedger,
   monthNumbers,
   ReservationConflictError,
+  thresholdKey,
   type Cap,
   type Change,
   type Ledger,
@@ -36,11 +37,13 @@ const id = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padS
 const taskId = id(900_000);
 const agentId = id(900_001);
 
-interface Period {
-  cap: Cap;
-  startSpent: number;
-  crossed: string[];
-}
+const capsOf = (cap: Cap) =>
+  (
+    [
+      ["soft", cap.soft],
+      ["hard", cap.hard],
+    ] as const
+  ).flatMap(([kind, amount]) => (amount === undefined ? [] : [{ kind, amount }]));
 
 function check(seed: number): void {
   const random = generator(seed);
@@ -49,7 +52,6 @@ function check(seed: number): void {
   const firstReplies = new Map<string, unknown>();
   const firstSettles = new Map<string, number>();
   const requests = new Map<string, { amountMicroUsd: number; ttlMs: number }>();
-  const periods: Period[] = [];
   let cap: Cap | undefined;
   let now = Date.parse("2026-10-10T12:00:00.000Z");
   let nextId = 1;
@@ -66,7 +68,12 @@ function check(seed: number): void {
         );
       }
       if (change.type === "budget.ThresholdCrossed") {
-        periods.at(-1)?.crossed.push(`${change.payload.cap}:${String(change.payload.percent)}`);
+        const { cap: kind, percent, spentMicroUsd, capMicroUsd } = change.payload;
+        assert.ok(cap, `${where}: a threshold without a cap`);
+        assert.equal(capMicroUsd, kind === "soft" ? cap.soft : cap.hard);
+        assert.equal(spentMicroUsd, before.spent, `${where}: the spend of the threshold`);
+        assert.ok(spentMicroUsd > 0 && spentMicroUsd * 100 >= capMicroUsd * percent);
+        assert.ok(!ledger.sent.has(thresholdKey(kind, percent)), `${where}: a threshold twice`);
       }
       eventRegistry[change.type][1].parse(change.payload);
       evolveLedger(ledger, change);
@@ -81,7 +88,6 @@ function check(seed: number): void {
       const hard = random.int(5000);
       const soft = random.next() < 0.5 ? random.int(hard) : undefined;
       cap = soft === undefined ? { hard } : { hard, soft };
-      periods.push({ cap, startSpent: ledger.spent, crossed: [] });
     } else if (roll < 0.45) {
       const reservationId = id(nextId);
       nextId += 1;
@@ -92,7 +98,10 @@ function check(seed: number): void {
         amountMicroUsd: random.int(1500),
         ttlMs: 1000 + random.int(4000),
       };
+      const room =
+        cap !== undefined && ledger.spent + ledger.reserved + request.amountMicroUsd <= cap.hard;
       const decision = decideReserve(ledger, cap, request, new Date(now));
+      assert.equal(decision.reply.ok, room, `${where}: a reserve is held when it fits`);
       assert.equal(decision.reply.ok, decision.changes[0]?.type === "budget.FundsReserved");
       requests.set(reservationId, request);
       firstReplies.set(reservationId, decision.reply);
@@ -141,12 +150,24 @@ function check(seed: number): void {
     } else if (roll < 0.85) {
       now += random.int(3000);
     } else {
-      const bookings = decideExpiry(ledger, cap, new Date(now));
-      for (const booking of bookings) {
+      const sweep = decideSweep(ledger, cap, new Date(now), { thresholds: true });
+      apply(sweep.thresholds);
+      for (const booking of sweep.bookings) {
         assert.equal(ledger.reservations.get(booking.reservationId)?.state, "held");
         apply(booking.changes);
       }
-      assert.deepEqual(decideExpiry(ledger, cap, new Date(now)), [], `${where}: expiry twice`);
+      for (const { kind, amount } of cap ? capsOf(cap) : []) {
+        for (const percent of [50, 80, 100]) {
+          if (ledger.spent > 0 && ledger.spent * 100 >= amount * percent) {
+            assert.ok(ledger.sent.has(thresholdKey(kind, percent)), `${where}: a due threshold`);
+          }
+        }
+      }
+      assert.deepEqual(
+        decideSweep(ledger, cap, new Date(now), { thresholds: true }),
+        { thresholds: [], bookings: [] },
+        `${where}: a second sweep has nothing to do`,
+      );
     }
 
     let held = 0;
@@ -171,51 +192,42 @@ function check(seed: number): void {
 
   const replayed = log.reduce<Ledger>(evolveLedger, emptyLedger(month));
   assert.deepEqual(replayed, ledger, `${where}: replay gives the same state`);
-
-  periods.forEach((period, index) => {
-    const endSpent = periods[index + 1]?.startSpent ?? ledger.spent;
-    const expected = crossings(month, period.cap, period.startSpent, endSpent).map((change) =>
-      change.type === "budget.ThresholdCrossed"
-        ? `${change.payload.cap}:${String(change.payload.percent)}`
-        : "",
-    );
-    assert.deepEqual(
-      [...period.crossed].sort(),
-      [...expected].sort(),
-      `${where}: each threshold is crossed once`,
-    );
-  });
 }
 
 test("random reserves, settles and expiries keep the budget rules", () => {
   for (let seed = 1; seed <= runs; seed += 1) check(seed);
 });
 
-test("a crossing is the first spend at or above the percent of the cap", () => {
+test("a threshold is due when the spend is at or above its line and it was not sent", () => {
   const random = generator(7);
   for (let run = 0; run < 1000; run += 1) {
     const hard = random.int(10_000);
-    const soft = random.int(hard);
-    const before = random.int(12_000);
-    const after = before + random.int(12_000);
-    const found = crossings(month, { hard, soft }, before, after).map((change) =>
+    const cap = { hard, soft: random.int(hard) };
+    const spent = random.int(12_000);
+    const sent = new Set<string>();
+    for (const { kind } of capsOf(cap)) {
+      for (const percent of [50, 80, 100]) {
+        if (random.next() < 0.3) sent.add(thresholdKey(kind, percent));
+      }
+    }
+    const before = new Set(sent);
+    const found = dueThresholds(month, cap, spent, sent).map((change) =>
       change.type === "budget.ThresholdCrossed"
         ? [change.payload.cap, change.payload.percent, change.payload.capMicroUsd]
         : [],
     );
-    const expected = (
-      [
-        ["soft", soft],
-        ["hard", hard],
-      ] as const
-    ).flatMap(([kind, amount]) =>
+    const expected = capsOf(cap).flatMap(({ kind, amount }) =>
       [50, 80, 100]
-        .filter((percent) => {
-          const line = (amount * percent) / 100;
-          return before < line && after >= line;
-        })
+        .filter(
+          (percent) =>
+            spent > 0 &&
+            spent >= (amount * percent) / 100 &&
+            !before.has(thresholdKey(kind, percent)),
+        )
         .map((percent) => [kind, percent, amount]),
     );
     assert.deepEqual(found, expected, `run ${String(run)}`);
+    for (const [kind, percent] of expected) sent.delete(`${String(kind)}:${String(percent)}`);
+    assert.deepEqual(sent, before, `run ${String(run)}: only the sent pairs are added`);
   }
 });

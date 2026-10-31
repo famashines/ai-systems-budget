@@ -10,18 +10,19 @@ import { ConcurrencyError, type EventStore } from "@famashines/ai-systems-kit/ev
 import { UnavailableError } from "@famashines/ai-systems-kit/http";
 import {
   capOf,
-  decideExpiry,
   decideReserve,
   decideSetBudget,
   decideSettle,
+  decideSweep,
   emptyLedger,
   evolveLedger,
   monthKey,
+  monthNumbers,
   previousMonth,
-  type Booking,
   type Cap,
   type Change,
   type Ledger,
+  type MonthNumbers,
 } from "../domain/budget.ts";
 
 export const capStreamId = "budget-cap-month";
@@ -50,10 +51,20 @@ interface Loaded {
   version: number;
 }
 
+interface Group {
+  correlationId: string;
+  causationId: string;
+  changes: Change[];
+}
+
 const isBudget = (event: { type: string }): event is Change => event.type.startsWith("budget.");
 
 export function createLedger({ store, timeZone, now }: Deps) {
-  let cap: { value: Cap | undefined; version: number } = { value: undefined, version: 0 };
+  let cap: {
+    value: Cap | undefined;
+    version: number;
+    cause?: { correlationId: string; causationId: string };
+  } = { value: undefined, version: 0 };
   const ledgers = new Map<string, Loaded>();
   let tail: Promise<unknown> = Promise.resolve();
 
@@ -76,9 +87,11 @@ export function createLedger({ store, timeZone, now }: Deps) {
 
   async function loadCap(): Promise<Cap | undefined> {
     for (const event of await store.readStream(capStreamId, { fromVersion: cap.version + 1 })) {
+      if (event.type !== "budget.BudgetSet") throw new Error(`${event.type} in ${capStreamId}`);
       cap = {
-        value: event.type === "budget.BudgetSet" ? capOf(event.payload) : cap.value,
+        value: capOf(event.payload),
         version: event.version,
+        cause: { correlationId: event.correlationId, causationId: event.eventId },
       };
     }
     return cap.value;
@@ -107,14 +120,9 @@ export function createLedger({ store, timeZone, now }: Deps) {
   const holding = (loaded: Loaded[], reservationId: string): Loaded | undefined =>
     loaded.find(({ ledger }) => ledger.reservations.has(reservationId));
 
-  async function book(loaded: Loaded, bookings: Booking[], actor: Actor): Promise<void> {
-    const events = bookings.flatMap(({ reservationId, taskId, changes }) =>
-      changes.map((change) => ({
-        ...change,
-        correlationId: taskId,
-        causationId: reservationId,
-        actor,
-      })),
+  async function book(loaded: Loaded, groups: Group[], actor: Actor): Promise<void> {
+    const events = groups.flatMap(({ correlationId, causationId, changes }) =>
+      changes.map((change) => ({ ...change, correlationId, causationId, actor })),
     );
     if (events.length === 0) return;
     await store.append({
@@ -132,7 +140,11 @@ export function createLedger({ store, timeZone, now }: Deps) {
         const loaded = holding([previous], request.reservationId) ?? current;
         const { reply, changes } = decideReserve(loaded.ledger, await loadCap(), request, at);
         const { reservationId, taskId } = request;
-        await book(loaded, [{ reservationId, taskId, changes }], caller);
+        await book(
+          loaded,
+          [{ correlationId: taskId, causationId: reservationId, changes }],
+          caller,
+        );
         return reply;
       }),
 
@@ -144,22 +156,43 @@ export function createLedger({ store, timeZone, now }: Deps) {
         const { reply, changes } = decideSettle(loaded.ledger, await loadCap(), request, at);
         const { reservationId } = request;
         const taskId = loaded.ledger.reservations.get(reservationId)?.taskId ?? reservationId;
-        await book(loaded, [{ reservationId, taskId, changes }], caller);
+        await book(
+          loaded,
+          [{ correlationId: taskId, causationId: reservationId, changes }],
+          caller,
+        );
         return reply;
       }),
 
     expire: (): Promise<number> =>
       write(async () => {
         const at = now();
-        const loaded = await months(at);
+        const [current, previous] = await months(at);
         const value = await loadCap();
         let expired = 0;
-        for (const month of loaded) {
-          const bookings = decideExpiry(month.ledger, value, at);
-          await book(month, bookings, sweeper);
-          expired += bookings.length;
+        for (const [loaded, thresholds] of [
+          [current, true],
+          [previous, false],
+        ] as const) {
+          const sweep = decideSweep(loaded.ledger, value, at, { thresholds });
+          const groups: Group[] = sweep.bookings.map(({ reservationId, taskId, changes }) => ({
+            correlationId: taskId,
+            causationId: reservationId,
+            changes,
+          }));
+          if (cap.cause && sweep.thresholds.length > 0) {
+            groups.unshift({ ...cap.cause, changes: sweep.thresholds });
+          }
+          await book(loaded, groups, sweeper);
+          expired += sweep.bookings.length;
         }
         return expired;
+      }),
+
+    month: (): Promise<MonthNumbers> =>
+      serial(async () => {
+        const [current] = await months(now());
+        return monthNumbers(current.ledger, await loadCap());
       }),
 
     setBudget: (

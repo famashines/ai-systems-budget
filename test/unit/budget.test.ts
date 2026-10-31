@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
-  decideExpiry,
   decideReserve,
   decideSetBudget,
   decideSettle,
+  decideSweep,
+  dueThresholds,
   emptyLedger,
   evolveLedger,
   monthKey,
@@ -204,7 +205,8 @@ describe("expiry", () => {
     const ledger = emptyLedger(month);
     apply(ledger, decideReserve(ledger, cap, request(1, 60, 1000), now).changes);
     apply(ledger, decideReserve(ledger, cap, request(2, 60, 5000), now).changes);
-    const bookings = decideExpiry(ledger, cap, later(1000));
+    const { bookings, thresholds } = decideSweep(ledger, cap, later(1000), { thresholds: true });
+    assert.deepEqual(thresholds, []);
     assert.equal(bookings.length, 1);
     assert.equal(bookings[0]?.reservationId, id(1));
     assert.deepEqual(
@@ -221,12 +223,66 @@ describe("expiry", () => {
       ],
     );
     for (const booking of bookings) apply(ledger, booking.changes);
-    const next = decideExpiry(ledger, cap, later(5000));
+    const next = decideSweep(ledger, cap, later(5000), { thresholds: false }).bookings;
     assert.deepEqual(
       next[0]?.changes.map(
         (change) => change.type === "budget.ThresholdCrossed" && change.payload.percent,
       ),
       [false, 80, 100],
+    );
+  });
+});
+
+describe("thresholds after a cap change", () => {
+  const settled = (cap: Cap, actualMicroUsd: number) => {
+    const ledger = given(cap, 100);
+    apply(ledger, decideSettle(ledger, cap, { reservationId: id(1), actualMicroUsd }, now).changes);
+    return ledger;
+  };
+
+  test("given a lower cap, when the sweep runs, then the due thresholds that were not sent come", () => {
+    const ledger = settled({ hard: 1000 }, 300);
+    assert.deepEqual(ledger.sent, new Set());
+    const { thresholds } = decideSweep(ledger, { hard: 400 }, now, { thresholds: true });
+    assert.deepEqual(
+      thresholds.map((change) => change.type === "budget.ThresholdCrossed" && change.payload),
+      [
+        {
+          scope: { kind: "month", key: month },
+          cap: "hard",
+          percent: 50,
+          spentMicroUsd: 300,
+          capMicroUsd: 400,
+        },
+      ],
+    );
+    apply(ledger, thresholds);
+    assert.deepEqual(decideSweep(ledger, { hard: 400 }, now, { thresholds: true }).thresholds, []);
+  });
+
+  test("given a higher cap, a threshold that was sent in the month is not sent again", () => {
+    const ledger = settled({ hard: 200 }, 150);
+    assert.deepEqual(ledger.sent, new Set(["hard:50"]));
+    const higher = { hard: 250 };
+    assert.deepEqual(decideSweep(ledger, higher, now, { thresholds: true }).thresholds, []);
+    assert.deepEqual(
+      dueThresholds(month, higher, 200, new Set(ledger.sent)).map(
+        (change) => change.type === "budget.ThresholdCrossed" && change.payload.percent,
+      ),
+      [80],
+    );
+  });
+
+  test("the sweep does not check thresholds when it is asked not to", () => {
+    const ledger = settled({ hard: 1000 }, 300);
+    assert.deepEqual(decideSweep(ledger, { hard: 100 }, now, { thresholds: false }).thresholds, []);
+  });
+
+  test("no spend gives no threshold, also with a cap of 0", () => {
+    const ledger = emptyLedger(month);
+    assert.deepEqual(
+      decideSweep(ledger, { hard: 0, soft: 0 }, now, { thresholds: true }).thresholds,
+      [],
     );
   });
 });
