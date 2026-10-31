@@ -12,10 +12,11 @@
   month from the owner time zone (`OWNER_TIME_ZONE`, default
   `Europe/Berlin`): `FundsReserved`, `ReservationRefused`,
   `ReservationSettled`, `ReservationExpired`, `ThresholdCrossed` (50, 80
-  and 100% of the soft and the hard cap).
+  and 100% of the soft and the hard cap, once for each pair in a month,
+  also after a cap change).
 - A reserve is held only if `spent + reserved + amount <= cap`. The check
-  and the append use the stream version, so two pods cannot hold more
-  than the cap together.
+  and the append use the stream version of the month. Budget runs as one
+  replica (see the known limits in `README.md`).
 - Expiry: a sweep each second books a hold that is past its `expiresAt`
   at the full amount. A settle after `expiresAt` gets `expired`.
 - `POST /internal/commands/set-budget` with a Keycloak bearer token of the

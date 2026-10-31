@@ -227,3 +227,86 @@ describe("two writers", () => {
     await assert.rejects(ledger.reserve(reserve(1)), /boom/);
   });
 });
+
+describe("the version check", () => {
+  test("a hold that another pod appends between the read and the append is seen before the decision", async () => {
+    const { clock, store, ledger: other } = setup();
+    await setCap(other, 100);
+    let raced = false;
+    const racing: EventStore = {
+      ...store,
+      append: async (input) => {
+        if (!raced && input.streamId.startsWith("budget-month-")) {
+          raced = true;
+          assert.equal((await other.reserve(reserve(60))).ok, true);
+        }
+        return store.append(input);
+      },
+    };
+    const ledger = createLedger({ store: racing, timeZone: "Europe/Berlin", now: clock.now });
+    assert.equal((await ledger.reserve(reserve(60))).ok, false);
+    assert.equal(raced, true);
+    const held = (await store.readStream(monthStreamId("2026-10"))).filter(
+      (event) => event.type === "budget.FundsReserved",
+    );
+    assert.equal(held.length, 1);
+  });
+});
+
+describe("thresholds after SetBudget", () => {
+  test("the sweep sends the due thresholds of a lower cap, caused by the BudgetSet", async () => {
+    const { store, ledger } = setup();
+    await setCap(ledger, 1000);
+    const { reservationId } = await ledger.reserve(reserve(500));
+    await ledger.settle({ reservationId, actualMicroUsd: 300 });
+    await setCap(ledger, 400);
+    assert.equal(await ledger.expire(), 0);
+    const [cap] = (await store.readStream(capStreamId)).slice(-1);
+    const crossed = (await store.readStream(monthStreamId("2026-10"))).filter(
+      (event) => event.type === "budget.ThresholdCrossed",
+    );
+    assert.deepEqual(
+      crossed.map((event) => event.payload.percent),
+      [50],
+    );
+    assert.equal(crossed[0]?.causationId, cap?.eventId);
+    assert.equal(crossed[0]?.correlationId, cap?.correlationId);
+    await ledger.expire();
+    assert.equal(
+      (await store.readStream(monthStreamId("2026-10"))).filter(
+        (event) => event.type === "budget.ThresholdCrossed",
+      ).length,
+      1,
+    );
+  });
+});
+
+describe("replay", () => {
+  test("a new ledger over the stored events gives the same month numbers", async () => {
+    for (let seed = 1; seed <= 20; seed += 1) {
+      const { clock, store, ledger } = setup();
+      let state = seed;
+      const random = (max: number): number => {
+        state = (state * 1103515245 + 12345) % 2147483648;
+        return state % (max + 1);
+      };
+      const held: string[] = [];
+      for (let step = 0; step < 40; step += 1) {
+        const roll = random(9);
+        if (roll === 0) {
+          const hard = random(3000);
+          await setCap(ledger, hard, random(1) ? random(hard) : undefined);
+        } else if (roll < 5) {
+          const reply = await ledger.reserve(reserve(random(800), ids(), 1000 + random(4000)));
+          if (reply.ok) held.push(reply.reservationId);
+        } else if (roll < 7) {
+          const reservationId = held[random(held.length)] ?? ids();
+          await ledger.settle({ reservationId, actualMicroUsd: random(1000) });
+        } else if (roll < 9) clock.advance(random(3000));
+        else await ledger.expire();
+      }
+      const fresh = createLedger({ store, timeZone: "Europe/Berlin", now: clock.now });
+      assert.deepEqual(await fresh.month(), await ledger.month(), `seed ${String(seed)}`);
+    }
+  });
+});

@@ -47,8 +47,6 @@ const aiProxyPublish = [
 
 const orchestrationPublish = [
   "orchestration.>",
-  "rpc.budget.reserve",
-  "rpc.budget.settle",
   "dlq.orchestration.>",
   "$JS.API.INFO",
   "$JS.API.STREAM.INFO.ORCHESTRATION",
@@ -88,6 +86,7 @@ accounts {
       ${user("ai-systems-budget", budgetPublish, budgetSubscribe, "allow_responses: true")}
       ${user("ai-systems-ai-proxy", aiProxyPublish, ["_INBOX_ai-proxy.>"])}
       ${user("ai-systems-orchestration", orchestrationPublish, ["_INBOX_orchestration.>"])}
+      ${user("ai-systems-intruder", ["rpc.budget.reserve", "rpc.budget.settle"], ["_INBOX_intruder.>"])}
     ]
   }
 }
@@ -102,6 +101,7 @@ let mongo: Mongo;
 let admin: Nats;
 let aiProxy: Nats;
 let orchestration: Nats;
+let intruder: Nats;
 let manager: JetStreamManager;
 let jwks: Server;
 let jwksUrl = "";
@@ -168,11 +168,18 @@ before(async () => {
   await startPod();
   aiProxy = await client("ai-proxy");
   orchestration = await client("orchestration");
+  intruder = await client("intruder");
 });
 
 after(async () => {
   for (const pod of pods) assert.equal(await pod.app.close(), true);
-  await Promise.all([admin.close(), aiProxy.close(), orchestration.close(), mongo.close()]);
+  await Promise.all([
+    admin.close(),
+    aiProxy.close(),
+    orchestration.close(),
+    intruder.close(),
+    mongo.close(),
+  ]);
   await new Promise((resolve) => jwks.close(resolve));
   await Promise.all([mongoContainer.stop(), natsContainer.stop()]);
 });
@@ -326,6 +333,52 @@ test("a hold with no settle expires at the full amount", async () => {
 });
 
 test("a request with a reply inbox that is not allowed gets no answer", async () => {
+  const before = await events().countDocuments();
+  await assert.rejects(
+    intruder.request(
+      RpcSubject.budgetReserve,
+      ReserveFundsRequestV1,
+      ReserveFundsReplyV1,
+      {
+        reservationId: randomUUID(),
+        taskId: randomUUID(),
+        agentId: randomUUID(),
+        amountMicroUsd: 1,
+      },
+      1000,
+    ),
+    UnavailableError,
+  );
+  await assert.rejects(
+    intruder.request(
+      RpcSubject.budgetSettle,
+      SettleReservationRequestV1,
+      SettleReservationReplyV1,
+      { reservationId: randomUUID(), actualMicroUsd: 1 },
+      1000,
+    ),
+    UnavailableError,
+  );
+  assert.equal(await events().countDocuments(), before);
+});
+
+test("a user with no publish grant on rpc.budget cannot reach budget, also with the ai-proxy inbox", async () => {
+  const { reservationId } = await reserve(50);
+  const before = await events().countDocuments();
+  const errors: unknown[] = [];
+  void (async () => {
+    for await (const status of orchestration.connection.status()) {
+      if (status.type === "error") errors.push(status.error);
+    }
+  })();
+  orchestration.connection.publish(
+    RpcSubject.budgetSettle,
+    JSON.stringify({ reservationId, actualMicroUsd: 0 }),
+    { reply: "_INBOX_ai-proxy.forged" },
+  );
+  await orchestration.connection.flush();
+  await waitFor(() => errors.length > 0, 5000);
+  assert.match(String(errors[0]), /Permissions Violation for Publish to "rpc\.budget\.settle"/);
   await assert.rejects(
     orchestration.request(
       RpcSubject.budgetReserve,
@@ -341,18 +394,12 @@ test("a request with a reply inbox that is not allowed gets no answer", async ()
     ),
     UnavailableError,
   );
-  const before = await events().countDocuments();
-  await assert.rejects(
-    orchestration.request(
-      RpcSubject.budgetSettle,
-      SettleReservationRequestV1,
-      SettleReservationReplyV1,
-      { reservationId: randomUUID(), actualMicroUsd: 1 },
-      1000,
-    ),
-    UnavailableError,
-  );
   assert.equal(await events().countDocuments(), before);
+  assert.deepEqual(await settle(reservationId, 5), {
+    state: "settled",
+    reservationId,
+    actualMicroUsd: 5,
+  });
 });
 
 test("a request that is not valid gets validation_failed and writes nothing", async () => {

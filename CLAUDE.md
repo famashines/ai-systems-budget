@@ -51,9 +51,11 @@ see the same sequence.
 
 The NATS config in the test has the grants of the users
 `ai-systems-budget`, `ai-systems-ai-proxy`, `ai-systems-orchestration`
-and `ai-systems-admin` from gitops
-(`kubernetes/infrastructure/nats/values.yaml`). Change them together with
-gitops. The test starts two pods on one MongoDB, so the version check
+(after gitops #185, with no `rpc.budget.*`) and `ai-systems-admin` from
+gitops (`kubernetes/infrastructure/nats/values.yaml`). Change them
+together with gitops. The user `ai-systems-intruder` is only in the test:
+it may publish on `rpc.budget.*` with its own inbox, to check the reply
+allow-list. The test starts two pods on one MongoDB, so the version check
 between pods runs. It signs tokens with `jose` against a local JWKS. Wait
 with `waitFor`, never with a fixed sleep. Pass `drainDelayMs: 0` to
 `start()`.

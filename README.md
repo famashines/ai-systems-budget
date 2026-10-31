@@ -47,7 +47,12 @@ a month or scopes.
 - A repeated reserve with the same `reservationId`, `taskId`, `agentId`
   and `amountMicroUsd` gives the first answer again, with no new event.
   The same `reservationId` with another of these values gives the error
-  code `conflict`. `ttlMs` is not compared: the events do not keep it.
+  code `conflict`.
+- `ttlMs` is not compared on a repeated reserve, because the events do not
+  keep it. This is safe: a repeat never makes a second hold, the amount is
+  compared, and the hold keeps the `expiresAt` of the first reserve. So a
+  repeat with another `ttlMs` cannot hold more money or hold it longer.
+  ai-proxy sends the same request again on a redelivery.
 - `expiresAt` is the time of the reserve plus `ttlMs` (default 10
   minutes).
 - Settle:
@@ -64,10 +69,16 @@ a month or scopes.
   cap. Then `overCapMicroUsd` shows it and every next reserve is refused.
 - The sweep runs each second and expires each hold that is at or past its
   `expiresAt`, booked at the full amount.
-- `ThresholdCrossed`: when a booking takes `spent` from below to at or
-  above 50, 80 or 100% of the soft cap or of the hard cap. One event for
-  each line that the booking crosses. The integer check is
-  `before * 100 < cap * percent <= after * 100`.
+- `ThresholdCrossed`: one event for each pair (soft or hard cap, 50, 80 or
+  100%) in each month. A pair is due when `spent > 0` and
+  `spent * 100 >= cap * percent`, and the month has no `ThresholdCrossed`
+  for the pair yet. The ledger keeps the sent pairs from the
+  `ThresholdCrossed` events. A settle or an expiry sends the pairs that
+  are due after its booking. The sweep also sends the due pairs of the
+  current month each second, so a lower cap (`BudgetSet`) gets its
+  thresholds in about one second. These have the `BudgetSet` as the cause
+  (`causationId` = its event id). A pair that was sent in the month is
+  not sent again after a higher cap.
 - Month numbers (`monthNumbers` in `src/domain/budget.ts`, the rule of
   `BudgetMonthV1`): `remaining = max(0, cap - spent - reserved)` and
   `overCap = max(0, spent - cap)`. With no cap, `capMicroUsd` is `null`
@@ -87,12 +98,22 @@ queue group, so one pod answers.
 | `rpc.budget.reserve` | `ReserveFundsRequestV1`      | `ReserveFundsReplyV1`      |
 | `rpc.budget.settle`  | `SettleReservationRequestV1` | `SettleReservationReplyV1` |
 
+- Who can call: the NATS publish grant on `rpc.budget.reserve` and
+  `rpc.budget.settle` is the real control. NATS does not check the reply
+  subject of a message against the grants of the publisher. So any user
+  that can publish on these subjects can send a request with the reply
+  `_INBOX_ai-proxy.<anything>`, and budget answers it. Only ai-proxy must
+  have this grant (gitops #185 removes it from orchestration). The
+  integration test shows that a user with no grant is refused by NATS and
+  writes nothing, also with a forged ai-proxy reply subject.
 - Reply allow-list (ADR 0025): the service answers only a request whose
   reply subject starts with `_INBOX_ai-proxy.`. It drops all other
   requests before the parse, with no answer, and counts them in
-  `rpc_requests_dropped_total`. In contracts v0.3.0 ai-proxy is the only
-  caller (it reserves and settles each attempt). Orchestration does not
-  call budget, so `_INBOX_orchestration.` is not on the list.
+  `rpc_requests_dropped_total`. This stops only the threat of ADR 0025: a
+  push consumer with a `deliver_subject` on these subjects, which the
+  server delivers without the publish grant of the user. In contracts
+  v0.3.0 ai-proxy is the only caller (it reserves and settles each
+  attempt), so `_INBOX_orchestration.` is not on the list.
 - zod checks the request before any database work. A bad request gets the
   error code `validation_failed`.
 - Errors in the `error-code` header: `conflict` (same id, other values),
@@ -111,7 +132,12 @@ Each change reads the streams, decides, and appends with
 from another pod gives `ConcurrencyError`; the service reads again and
 decides again, at most 10 times. In one pod, the changes run one after the
 other. The integration test sends 60 reserves at the same time to two pods
-and checks that exactly the amount that fits is held.
+and checks that exactly the amount that fits is held. A unit test puts an
+append of another pod between the read and the append, and checks that
+the version check sees it.
+
+Budget runs as one replica (gitops, task M2-09), because of the two
+limits below with two pods.
 
 ## API
 
@@ -127,7 +153,9 @@ and checks that exactly the amount that fits is held.
 
 The request needs `Authorization: Bearer <access token>`, checked by
 `kit/auth` with the role `owner` (issuer `OIDC_ISSUER`, audience
-`OIDC_AUDIENCE`). api-gateway sends the token of the owner on. The body is
+`OIDC_AUDIENCE`). The api-gateway budget route must forward the
+`Authorization` header of the owner (it does not forward it today). The
+body is
 a `CommandEnvelopeV1` with a `SetBudgetCommandPayloadV1`:
 
 ```json
@@ -185,6 +213,10 @@ A bad value stops the process at start with the variable name. An empty
 value is a value: delete the line to get the default. The kit service
 name is fixed to `budget`, so the NATS inbox prefix is `_INBOX_budget`.
 
+Deploy (M2-09): set `OIDC_JWKS_URL` to the Keycloak service inside the
+cluster, and add a NetworkPolicy egress from budget to Keycloak for the
+JWKS.
+
 NATS grants that the service needs (gitops, user `ai-systems-budget`):
 publish `budget.>`, `dlq.budget.>`, `$JS.API.INFO`,
 `$JS.API.STREAM.INFO.BUDGET`; subscribe `_INBOX_budget.>`,
@@ -238,5 +270,14 @@ request in `famashines/gitops` for
   reads the full month streams.
 - A settle or a repeated reserve that comes more than one month later
   does not find its hold: it gets `unknown`, or a new reserve.
-- The month cap is read at the time of the change. A reserve that runs at
-  the same time as a SetBudget can use the cap from before it.
+- Two pods: a reserve on one pod that runs at the same time as a
+  SetBudget on another pod can use the cap from before it, and so hold
+  more than a new lower cap. The reason: the cap is in its own stream,
+  and the append of a reserve checks only the version of the month
+  stream. Budget runs as one replica, where the lock puts the two changes
+  one after the other. Upgrade path for more replicas: keep the cap in the
+  month stream, or check the cap version again in the reserve append.
+- Two pods: the same `reservationId` at the start of a month can be held
+  in two months, when two pods get it at the same time and one sees the
+  old month and one the new month. This is rare and on the safe side
+  (more money is held, never less). One replica removes it.
